@@ -195,7 +195,7 @@ CUDA12_MIN_DRIVER = 528 if WIN else 525
 ENGINE12_DIR = "engine-cuda12"
 MIN_ENGINE = (0, 1, 44, 1)             # versions compare all numbers; v0.1.44.1: CPUs without AVX2 start again (#2324: an illegal instruction before main in the NVFP4 CPU rows), the CUDA 12.0/12.1 toolkits build (#2322), a crashed engine start is named instead of retried as a GPU runtime start, Mac M2 (#2323); v0.1.44: UD-Q4/Q5/Q6_K_XL and Q8_0 Unsloth files in setup (K-quant experts, MMQ prompt library strata_kq), NVFP4 packs, Qwen3.6-35B-A3B, Intel Arc A-series kernels, the pipelined-decode and latency work; v0.1.43.1: the adaptive overlap no longer collapses decode on pinned-host desktops (#1964 #1975), Windows PLE mmap stall (#1984), pinned prompt uploads (#1996), the I/O watchdog allowance; v0.1.43: adaptive-tier copies overlap on CUDA, P100 (sm_60) kernel tables, RDNA4 (gfx1200/gfx1201) defaults (route tail skip, measured PCIe share, 16K prompt chunks, fused IQ3 prompt experts); v0.1.42.1: the GGUF-in-place file tier on Windows unmaps every shard, dual-socket starts judge each NUMA node and STRATA_DROP_CACHE_ON_EXIT, tools/strata_bench.py; v0.1.42: STRATA_ROUTE_TAIL_SKIP=7 default on CUDA (+13-16% decode), the AMD 2-GPU checkpoint fix (H13), Phase 2 fixes and opt-ins; v0.1.41.1 (folded into 0.1.42): the #1576 card order, #1616 stage size, #1595 CPU share, #1630/#1607 Windows HIP chunk cap and commit-limit warning, #1603 parallel-request bookkeeping; v0.1.41: CPU prefill share on by default (NVIDIA, chunks < 1024), --batch-groups auto, the file tier read in batches on Windows, Pascal decode fix, per-arch tables; v0.1.40.3: the #1357 MTP router guard, the #1376 Windows HIP cache floor, #461 runtime DLLs, Intel A750 first-request fix; v0.1.40.2: F4 verify windows, the Linux file tier (#1194), the stager wait (#1057), #1264/#1201/#1139 fixes, opt-in CPU share (#1282), Intel Arc; v0.1.40: --resident-experts on a layer split with the split+resident variant (#848), --kv k8v4 with KV streaming (#711); v0.1.39: the #577 file-tier regression fixed, the OpenAI Responses API (#451, Codex), a reply stuck on one token ended (#606), the head before the arena (#620), effort_position (#458), --vram-reserve hot resize opt-in (#533), PR batch; v0.1.38: prompts faster (one gather per expert group #372, the first chunk's PLE rows beside layer 0 #374, DeltaNet three heads per thread #413), --kv q4_0 prompts on tensor cores (#452), Q5_0 experts on the GPU (#473), IQ4_XS on AVX-2 (#415), unbuffered expert loading on Windows (#357 #362), --peer-device (#531), a 6 GB card starts (#496), PR batch; v0.1.37: a silent engine is restarted (#481), Windows AMD counts the desktop's VRAM (#380 #377 #497), a steadier PCIe probe (#485), fixes #496 #495 #498 #505 #493; v0.1.36: a cancelled prompt logged as read so far (#471), the draft-head hint (#474), UPDATE.bat (#475), --expert-profile-save (#477); v0.1.35: Windows AMD uses its bundled HIP runtime (#468 #461), the low-RAM resident mode on Windows 32 GB (#467), fixes #460 #459 #446 #447 #457 #448 #444; v0.1.34: AMD on Windows (a ready-made HIP engine), an MCP server for AI assistants (tools/strata_mcp.py), a shorter README; v0.1.33: a portable image encoder again (#411 #412), setup recommends instead of forcing (#406 #403 #364 #384), fixes #352 #365 #369 #371 #375 #393 #408 #414; v0.1.32: split prompts faster (#340), AMD router +12%, Unsloth Q4 in setup, faster Q4 prompts, #326/#327/#342/#344 fixes, PR batch; v0.1.31: Unsloth UD-Q4_K_XL (experimental), GGUF-in-place low-RAM mode, Windows GGUF load 2x, server race + tokenizer fixes, AMD intrinsics; v0.1.30: short prompts faster (streaming from 1024 tokens), resident low-RAM variant, multi-GPU session carve, RDNA4; v0.1.29: sampled answers faster (split top-k), #154 correctness fixes; v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 # KV bytes per context token and attention layer: 8-bit 1056, rotated 4-bit 576, hybrid K8V4 (8-bit K, 4-bit V) 816
-KV_CELL_BYTES = {"q4_0": 576, "k8v4": 816}
+KV_CELL_BYTES = {"q4_0": 576, "nvfp4": 576, "k8v4": 816}
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
 REQUIREMENTS = ROOT / "requirements.txt"   # the same packages and their dependencies, pinned (#214)
 
@@ -3825,6 +3825,16 @@ def install_build_tools(gpu, yes):
 
 
 def cmake_build(src, bdir, target, defs, vcvars, bat_name):
+    # host_compiler_defs leaves a launcher-form CC / CXX / CUDAHOSTCXX out of the definitions; CMake would still take
+    # it from the environment on a build folder's first configure, so the build runs without it
+    drop = [n for n in COMPILER_VARS if launcher_form(os.environ.get(n, ""))]
+    # a folder whose configure stopped on such a value keeps it in its cache: configured afresh
+    cache = Path(bdir) / "CMakeCache.txt"
+    if cache.exists() and any(launcher_form(line.split("=", 1)[1])
+                              for line in cache.read_text(encoding="utf-8", errors="replace").splitlines()
+                              if line.startswith(("CMAKE_C_COMPILER:", "CMAKE_CXX_COMPILER:",
+                                                  "CMAKE_CUDA_HOST_COMPILER:")) and "=" in line):
+        cache.unlink()
     cmake, ninja = find_tool("cmake"), find_tool("ninja")
     if cmake is None or ninja is None:
         fail("cmake / ninja not found after installing them", "run: .venv python -m pip install cmake ninja")
@@ -3839,15 +3849,17 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
                  "install them (Visual Studio 2019 or 2022, workload 'Desktop development with C++') and run setup again")
         bat = ROOT / bat_name
         q = lambda c: " ".join(f'"{x}"' if " " in str(x) else str(x) for x in c)  # noqa: E731
-        bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{q(conf)} || exit /b 1\r\n{q(build)} && exit /b 0\r\n'
+        unset = "".join(f'set "{n}="\r\n' for n in drop)
+        bat.write_text(f'@echo off\r\n{unset}call "{vcvars}" >nul\r\n{q(conf)} || exit /b 1\r\n{q(build)} && exit /b 0\r\n'
                        f'echo   (the build stopped - trying it once more)\r\n{q(build)} || exit /b 1\r\n',
                        encoding="utf-8")
         run(["cmd", "/c", str(bat)])
     else:
-        run(conf)
-        if run(build, check=False).returncode != 0:
+        env = {k: v for k, v in os.environ.items() if k not in drop} if drop else None
+        run(conf, env=env)
+        if run(build, env=env, check=False).returncode != 0:
             say("  (the build stopped - trying it once more)")
-            run(build)
+            run(build, env=env)
 
 
 ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/ggml")
@@ -3873,15 +3885,36 @@ def isa_floor_defs(floor: str, bdir: Path, meta: dict) -> list:
     return [f"-DSTRATA_ISA_FLOOR={floor}"] if floor else []
 
 
+COMPILER_VARS = ("CC", "CXX", "CUDAHOSTCXX")
+
+
+def launcher_form(value: str) -> bool:
+    """A compiler variable in launcher form - a compiler cache, then the compiler (CC="kache clang-cl", "ccache gcc") -
+    which CMake cannot take as its compiler.  A full path with spaces in it is a compiler."""
+    v = value.strip()
+    return bool(v) and any(c.isspace() for c in v) and not Path(v).is_file()
+
+
 def host_compiler_defs(cuda: bool) -> list:
     """CC / CXX / CUDAHOSTCXX pick the host compilers of a build - as -D definitions, so an existing build folder
     takes them too (the environment reaches CMake only on a folder's first configure, which is why CXX=g++-14 alone
     could die at the last step, #1645).  CUDAHOSTCXX is nvcc's host compiler (-ccbin); it defaults to CXX, as
     CMake's does.  `cuda`: the project compiles CUDA (the host-compiler definition means nothing to a C++-only
-    one)."""
-    cc = os.environ.get("CC", "").strip()
-    cxx = os.environ.get("CXX", "").strip()
-    hostcxx = os.environ.get("CUDAHOSTCXX", "").strip() or cxx
+    one).  A value in launcher form - a compiler cache, then the compiler (CC="kache clang-cl", "ccache gcc") - is no
+    compiler CMake can take as CMAKE_<LANG>_COMPILER (configure stopped at "not a full path and was not found"): it is
+    left out with a note, and the build takes the compiler its environment finds (on Windows MSVC's cl, which nvcc
+    needs as its host compiler there).  A full path with spaces in it is a compiler and is kept."""
+    def compiler(name):
+        v = os.environ.get(name, "").strip()
+        if launcher_form(v):
+            warn(f'{name}="{v}" is a launcher and a compiler, which CMake cannot take as its compiler: the build uses '
+                 f"the compiler its environment finds instead (a cache goes in CMAKE_{'C' if name == 'CC' else 'CXX'}"
+                 "_COMPILER_LAUNCHER)")
+            return ""
+        return v
+    cc = compiler("CC")
+    cxx = compiler("CXX")
+    hostcxx = compiler("CUDAHOSTCXX") or cxx
     return ([f"-DCMAKE_C_COMPILER={cc}"] if cc else []) + \
            ([f"-DCMAKE_CXX_COMPILER={cxx}"] if cxx else []) + \
            ([f"-DCMAKE_CUDA_HOST_COMPILER={hostcxx}"] if cuda and hostcxx else [])
@@ -4590,7 +4623,7 @@ def choices_from_config(cfg_path: Path) -> dict:
     esp_path = esp.rsplit(":", 1)[0] if esp else None
     return {"family": family, "model": model if model in MODELS else None,
             "context": int(val("--max-context")) if val("--max-context") else None,
-            "kv": val("--kv") if val("--kv") in ("int8", "q4_0") else None,
+            "kv": val("--kv") if val("--kv") in ("int8", "q4_0", "k8v4", "nvfp4") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
             "esp": ("on" if Path(esp_path).name == ESP_VECTOR.name else esp_path) if esp_path else "off",
             "host": cfg.get("host"), "api_key": cfg.get("api_key"), "port": cfg.get("port"), "gpu": cfg.get("gpu"),
@@ -5104,7 +5137,7 @@ UD_FIT_MIN_SLACK_MIB = 64         # at least a few cache slots beside the estima
 UD_FIT_CARD_GB = 9.5              # the check is for cards up to here
 UD_FIT_RUNTIME_MIB = 250          # CUDA / HIP: the runtime's own context (the SYCL measurement above has none of it)
 UD_FIT_ENGINE_RESERVE_MIB = 300   # the reserve the engine settles on when none is given and the card is tight
-UD_FIT_KV_BYTES = {"fp16": 2112, "int8": 1056, "q4_0": 576, "k8v4": 816}   # per token per attention layer (13)
+UD_FIT_KV_BYTES = {"fp16": 2112, "int8": 1056, "q4_0": 576, "nvfp4": 576, "k8v4": 816}   # per token per attention layer (13)
 UD_FIT_CTX_STEPS = (8192, 6144, 4608)
 
 
@@ -5126,7 +5159,7 @@ def unsloth_small_card_plan(vram_gb: float, ctx: int, kv: str, reserve_mib: int 
     up to 2x slower, but 0.8 GB for the cache); a value the user chose (--context, --kv) is not changed."""
     reserve = UD_FIT_ENGINE_RESERVE_MIB if reserve_mib is None else reserve_mib
     ctxs = [ctx] if ctx_fixed else [ctx] + [c for c in UD_FIT_CTX_STEPS if c < ctx]
-    kvs = [kv] if kv_fixed or kv == "q4_0" else [kv, "q4_0"]
+    kvs = [kv] if kv_fixed or kv in ("q4_0", "nvfp4") else [kv, "q4_0"]
     for mtp in (True, False):
         for c in ctxs:
             for k in kvs:
@@ -5160,7 +5193,7 @@ PARALLEL_COST_NOTE = ("parallel N reduces waiting for several users but costs ab
 def parallel_slot_gb(ctx: int, kv: str, streaming: bool) -> float:
     """#465: the VRAM one batch slot's session takes: its KV cache (12 QSA layers; with KV streaming only the 32K
     positions the attention reads stay in VRAM) and the DeltaNet state (~0.17 GB).  Measured: 0.56 GiB at 32K int8."""
-    kv_tok = 12 * (576 if kv == "q4_0" else 1056)
+    kv_tok = 12 * (576 if kv in ("q4_0", "nvfp4") else 1056)
     return (min(ctx, 32768) if streaming else ctx) * kv_tok / 1e9 + 0.17
 
 
@@ -5719,9 +5752,10 @@ def main() -> int:
     ap.add_argument("--rope-scale", type=float,
                     help="the extension factor (default: the final context over the trained 262144, at least 1 - "
                          "1.5 for 384K, 2 for 512K, 1 inside the trained range)")
-    ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4"],
+    ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4", "nvfp4"],
                     help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
-                         "precise) or k8v4 (hybrid: INT8 K + 4-bit V, 816 B/cell)")
+                         "precise), k8v4 (hybrid: INT8 K + 4-bit V, 816 B/cell) or nvfp4 (q4_0's memory, NVFP4 "
+                         "blocks; the NVIDIA engine only, see bench/results/2026-10-14-kv-nvfp4)")
     ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
                     help="let the model read images (yes = the encoder on the GPU)")
     ap.add_argument("--vision-tokens", type=int, metavar="N",
@@ -5823,6 +5857,8 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if a.kv == "nvfp4" and (a.backend == "sycl" or sys.platform == "darwin"):
+        ap.error("--kv nvfp4 is in the NVIDIA (CUDA) engine only: the Intel Arc and Mac engines do not have it")
     if a.model and a.model not in MODELS and a.family not in PREVIEW_FAMILIES:
         ap.error(f"--model {a.model} is a size of " + ", ".join(f"--family {f}" for f, d in PREVIEW_FAMILIES.items()
                                                               if a.model in d["models"]))
@@ -6292,7 +6328,8 @@ def main() -> int:
         say("             documents; long-context lookups (needle tests) still pass")
         kv = ["int8", "q4_0"][int(ask("KV cache?", ["1", "2"], "1", a.yes)) - 1]
     if ctx > 8192:
-        ok(f"KV cache: {'8-bit' if kv == 'int8' else '4-bit (Hadamard-rotated)'}")
+        ok("KV cache: " + {"int8": "8-bit", "k8v4": "8-bit K, 4-bit V (Hadamard-rotated)",
+                           "nvfp4": "NVFP4 (4-bit, Hadamard-rotated)"}.get(kv, "4-bit (Hadamard-rotated)"))
     if MODELS[model].get("vision", fam.get("vision")) is False:     # UD-IQ4_XS: images, unlike UD-Q4_K_XL
         vision = "none"
         if a.vision not in (None, "no", "none"):

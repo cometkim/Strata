@@ -585,6 +585,68 @@ class HostCompilers(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CC": "", "CXX": "", "CUDAHOSTCXX": ""}):
             self.assertEqual(setup.host_compiler_defs(True), [])
 
+    def test_launcher_form_is_left_out(self):
+        """CC="kache clang-cl" (a compiler cache, then the compiler) stopped CMake's configure: left out, with a note."""
+        with mock.patch.dict(os.environ, {"CC": "kache clang-cl", "CXX": "ccache g++", "CUDAHOSTCXX": ""}):
+            defs, out = quiet(setup.host_compiler_defs, True)
+            self.assertEqual(defs, [])
+            self.assertIn('CC="kache clang-cl"', out)
+            self.assertIn('CXX="ccache g++"', out)
+        with mock.patch.dict(os.environ, {"CC": "", "CXX": "g++-14", "CUDAHOSTCXX": "sccache g++-14"}):
+            self.assertEqual(quiet(setup.host_compiler_defs, True)[0], ["-DCMAKE_CXX_COMPILER=g++-14",
+                                                                        "-DCMAKE_CUDA_HOST_COMPILER=g++-14"])
+
+    def test_the_build_runs_without_a_launcher_form_compiler(self):
+        """CMake takes CC / CXX from the environment on a folder's first configure: the build runs without them, and a
+        folder whose configure stopped on one (its cache keeps it) is configured afresh."""
+        with tempfile.TemporaryDirectory() as d:
+            root, bdir = Path(d), Path(d) / "build"
+            bdir.mkdir()
+            (bdir / "CMakeCache.txt").write_text("CMAKE_CXX_COMPILER:UNINITIALIZED=kache clang-cl\n")
+            ran = []
+            env = {"CC": "kache clang-cl", "CXX": "kache clang-cl", "CUDAHOSTCXX": ""}
+            with mock.patch.dict(os.environ, env), mock.patch.object(setup, "ROOT", root), \
+                    mock.patch.object(setup, "WIN", True), mock.patch.object(setup, "find_tool", lambda n: n), \
+                    mock.patch.object(setup, "run", lambda cmd, **kw: ran.append((cmd, kw))):
+                setup.cmake_build(root, bdir, "strata", [], "vcvars64.bat", "build-strata.bat")
+            bat = (root / "build-strata.bat").read_text(encoding="utf-8")
+            self.assertIn('set "CC="', bat)
+            self.assertIn('set "CXX="', bat)
+            self.assertNotIn('set "CUDAHOSTCXX="', bat)            # not set: nothing to clear
+            self.assertLess(bat.index('set "CXX="'), bat.index("vcvars64.bat"))
+            self.assertFalse((bdir / "CMakeCache.txt").exists())
+            ran.clear()
+            with mock.patch.dict(os.environ, env), mock.patch.object(setup, "ROOT", root), \
+                    mock.patch.object(setup, "WIN", False), mock.patch.object(setup, "find_tool", lambda n: n), \
+                    mock.patch.object(setup, "run", lambda cmd, **kw: ran.append((cmd, kw)) or
+                                      mock.Mock(returncode=0)):
+                setup.cmake_build(root, bdir, "strata", [], None, "build-strata.bat")
+            self.assertTrue(ran)
+            for _, kw in ran:
+                self.assertNotIn("CC", kw["env"])
+                self.assertNotIn("CXX", kw["env"])
+        with tempfile.TemporaryDirectory() as d:   # a plain compiler: the environment as it is, the cache kept
+            root, bdir = Path(d), Path(d) / "build"
+            bdir.mkdir()
+            (bdir / "CMakeCache.txt").write_text("CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/g++-14\n")
+            ran = []
+            with mock.patch.dict(os.environ, {"CC": "", "CXX": "g++-14", "CUDAHOSTCXX": ""}), \
+                    mock.patch.object(setup, "ROOT", root), mock.patch.object(setup, "WIN", False), \
+                    mock.patch.object(setup, "find_tool", lambda n: n), \
+                    mock.patch.object(setup, "run", lambda cmd, **kw: ran.append((cmd, kw)) or
+                                      mock.Mock(returncode=0)):
+                setup.cmake_build(root, bdir, "strata", [], None, "build-strata.bat")
+            self.assertTrue((bdir / "CMakeCache.txt").exists())
+            self.assertTrue(all(kw["env"] is None for _, kw in ran))
+
+    def test_a_path_with_spaces_is_a_compiler(self):
+        with tempfile.TemporaryDirectory() as d:
+            cc = Path(d) / "Program Files" / "cl.exe"
+            cc.parent.mkdir()
+            cc.write_bytes(b"")
+            with mock.patch.dict(os.environ, {"CC": str(cc), "CXX": "", "CUDAHOSTCXX": ""}):
+                self.assertEqual(setup.host_compiler_defs(True), [f"-DCMAKE_C_COMPILER={cc}"])
+
     def test_the_defs_reach_cmake(self):
         """The engine's and the CUDA encoder's configure both take them."""
         with tempfile.TemporaryDirectory() as d:

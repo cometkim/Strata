@@ -992,7 +992,7 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "vision": {"type": "string", "enum": ["no", "yes", "gpu", "cpu"],
                         "description": "let the model read images (yes = the encoder on the GPU; ~0.9 GB more "
                                        "download); default no"},
-             "kv": {"type": "string", "enum": ["int8", "q4_0", "k8v4"],
+             "kv": {"type": "string", "enum": ["int8", "q4_0", "k8v4", "nvfp4"],
                     "description": "KV cache precision above 8K context (default int8)"},
              "gpu": {"type": "integer", "minimum": 0, "maximum": 63,
                      "description": "one GPU, as nvidia-smi numbers them (default: the one with the most VRAM)"},
