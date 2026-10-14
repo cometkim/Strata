@@ -30,6 +30,7 @@ struct QsaAttnPools {
     const uint8_t* k_q4 = nullptr;      ///< q4_0 block_q4_0 [page][kv_head][page_size][head_dim / 32 * 18]
     const uint8_t* v_q4 = nullptr;
     const int32_t* page_table = nullptr;
+    bool nvfp4 = false;                 ///< k_q4/v_q4 hold NVFP4 blocks (`--kv nvfp4`, kv_q4.hpp), not q4_0
 };
 
 /// Scratch floats for `cap` selected cells: partial accumulators, maxima and sums.

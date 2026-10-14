@@ -1312,8 +1312,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_b, kStepCount, n, vc_b, vc_b, s, cs,
                                            mirror ? &hv : nullptr);
                     } else if (st.kv_q4)
-                        kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, n, kc_b, vc_b, s, cs,
-                                           &st.host);
+                        (st.kv_nvfp4 ? kv_append_nvfp4_steps : kv_append_q4_steps)(
+                            st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, n, kc_b, vc_b, s, cs, &st.host);
                     else if (st.kv_int8)
                         kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_b, kStepCount,
                                            kc_b, vc_b, (int) (NKV * HD), n, s, cs, &st.host);
@@ -1333,8 +1333,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
                                           vcur_ + t * NKV * HD, s, cs, mirror ? &hv : nullptr);
                     } else if (st.kv_q4)
-                        kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
-                                          vcur_ + t * NKV * HD, s, cs, &st.host);
+                        (st.kv_nvfp4 ? kv_append_nvfp4_step : kv_append_q4_step)(
+                            st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs,
+                            &st.host);
                     else if (st.kv_int8)
                         kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
                                           kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);

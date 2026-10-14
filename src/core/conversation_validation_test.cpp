@@ -116,6 +116,13 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     if (!zero_qsa) { image.kv.push_back(first.image(g, true)); image.kv.push_back(last.image(g, true)); }
     image.kv.push_back(draft.image(g, false));
     check(conversation_snapshot_validate(image, ss, g, draft.st, error), "complete image validates without CUDA");
+    if (format == 2 && !zero_qsa) {   // `--kv nvfp4` has q4_0's byte counts, not its meaning: never restored across
+        for (QsaState& l : layers) l.kv_nvfp4 = true;
+        draft.st.kv_nvfp4 = true;
+        check(!conversation_snapshot_validate(image, ss, g, draft.st, error), "q4_0 image rejected by an NVFP4 state");
+        for (QsaState& l : layers) l.kv_nvfp4 = false;
+        draft.st.kv_nvfp4 = false;
+    }
     size_t estimate = 0;
     check(conversation_snapshot_bytes({image.live.ids,image.live.imgs,image.checkpoints,true},ss,g,draft.st,estimate,error),
           "capture estimate works without CUDA");

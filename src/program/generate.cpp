@@ -721,6 +721,8 @@ void usage() {
                  "                       VRAM; default fp16 until gate G-C accepts int8\n"
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
+                 "  --kv nvfp4           opt-in: the q4_0 memory (576 B/cell), K/V as rotated NVFP4 (a UE4M3 scale\n"
+                 "                       per 16 values; see bench/results/2026-10-14-kv-nvfp4)\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
                  "                       (vs int8's 1,056); streams with --kv-resident too\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
@@ -2543,12 +2545,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (o.kv == "q4") o.kv = "q4_0";
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
-        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && o.kv != "nvfp4") {
+        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, nvfp4 or k8v4\n");
         return 2;
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
-    strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
+    strata::core::qsa_set_kv_q4(o.kv == "q4_0" || o.kv == "nvfp4");   // PR #21: 4-bit codes after a Hadamard rotation
+    strata::core::qsa_set_kv_nvfp4(o.kv == "nvfp4");   // the same pools as q4_0, NVFP4 blocks (kv_q4.hpp)
     // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to
     // fp16 K/V improved on an NVFP4 pack (0.0066 -> 0.0051) but not on IQ2_XS (0.0022 -> 0.0054)
     const char* kv_rot = std::getenv("STRATA_KV_ROT");
@@ -3996,6 +3999,7 @@ int main(int argc, char** argv) {
                 qs[(size_t) j].n_pages = pages;
                 qs[(size_t) j].kv_int8 = i8;
                 qs[(size_t) j].kv_q4 = q4;
+                qs[(size_t) j].kv_nvfp4 = q4 && strata::core::qsa_kv_nvfp4();
                 qs[(size_t) j].kv_hybrid = hyb;
             }
             strata::core::SessionState ss{};

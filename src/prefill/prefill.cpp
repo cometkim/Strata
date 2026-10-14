@@ -1536,7 +1536,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
             strata::kernels::fwht256_inplace_cuda(Vc, nb * g.n_head_kv, m.cs);
         }
         if (st.kv_q4) {
-            strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
+            (st.kv_nvfp4 ? strata::kernels::kv_append_nvfp4 : strata::kernels::kv_append_q4)(
+                st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host, nullptr);
         } else {
             kv_append(Kc, Vc, nb, c0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs, &st.host);
@@ -2770,8 +2771,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
                         }
                         if (st.kv_q4)
-                            strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
-                                                          host_w, staged ? &m.stage : nullptr);
+                            (st.kv_nvfp4 ? strata::kernels::kv_append_nvfp4 : strata::kernels::kv_append_q4)(
+                                st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs, host_w,
+                                staged ? &m.stage : nullptr);
                         else
                             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
@@ -2911,8 +2913,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                     }
-                    const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
-                                                                       : core::qsa_attn_pools(st);
+                    strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
+                                                                 : core::qsa_attn_pools(st);
+                    pools.nvfp4 = st.kv_nvfp4;   // the staging pool holds the state's own 4-bit codec
                     pt.mark(kPfQsaAttn, cs);
                     // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level
                     // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV, or STRATA_PROMPT_ATTN_OLD=1: the

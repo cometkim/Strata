@@ -94,6 +94,14 @@ VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the
 slower. It streams its KV cache like the other formats (`--kv-resident N`): on an RTX 2060 SUPER 8 GB at 128K with
 20,480 resident cells, +780 expert slots over resident K8V4, and it scores better than 4-bit KV on long documents.
 
+**NVFP4 KV cache (opt-in):** `--kv nvfp4` stores K and V as NVFP4 (a UE4M3 scale per 16 values, ggml's block layout)
+after the same Hadamard rotation as `--kv q4_0`, in the same memory (576 B per cell and layer). Each 16 values get the
+scale of least squared error among ggml's and its neighbours. RTX 5090, IQ3_S, four texts read through the decode
+kernel: mean KL to fp16 K/V 0.035 against q4_0's 0.064 (int8 0.014). Prompts read on tensor cores with a kernel that
+takes 30% less time than q4_0's: 1,428 instead of 1,415 tokens/s at 32K (int8 1,404); decode is not measurably
+different. CUDA, sm_80 and newer for the prompt kernel. Setup does not ask: `START-HERE.bat --setup --kv nvfp4`, or
+`--kv nvfp4` in a `strata-*.json`. Details: [`bench/results/2026-10-14-kv-nvfp4`](../bench/results/2026-10-14-kv-nvfp4/README.md).
+
 **Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
 expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
 slightly differently. How many tokens share an expert depends on the drafts in a verify window, so the same prompt

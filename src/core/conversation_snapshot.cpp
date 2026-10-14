@@ -49,8 +49,10 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
     // STRATA_KV_ROT=1) is another format too (+16): its bytes mean nothing to a state that does not rotate, so a
     // snapshot or prompt checkpoint taken with the rotation never restores into one without it, nor the reverse.
     // (Q4_0 is always rotated: nothing to tell apart; without the rotation the format is the one it always was.)
+    // NVFP4 in the q4 pools (`--kv nvfp4`) has q4_0's byte counts but not its meaning: another format (+32).
     const int rotated = st.kv_rot && !st.kv_q4 && !st.kv_hybrid ? 16 : 0;
-    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
+    const int nvfp4 = st.kv_q4 && st.kv_nvfp4 ? 32 : 0;
+    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated + nvfp4, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
     using conversation_detail::product;
     if (!product(l.data, {(uint64_t) cells, (uint64_t) g.n_head_kv, per}) ||
         !product(l.scales, {(uint64_t) cells, (uint64_t) g.n_head_kv,

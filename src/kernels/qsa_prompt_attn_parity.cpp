@@ -1,7 +1,7 @@
 // src/kernels/qsa_prompt_attn_parity.cpp - perf-review D-1: the tensor-core prompt attention (qsa_prompt_attn.hpp)
 // against the FP32 kernel it replaces (`qsa_decode_attn_batch`) and an FP64 host reference (GPU, synthetic, no model).
 //
-// Int8, FP16 and Q4_0 pools with random codes, scales and queries; selections shaped like the prompt path's (the 2,051
+// Int8, FP16, Q4_0 and NVFP4 pools with random codes, scales and queries; selections shaped like the prompt path's (the 2,051
 // widest, a recent window plus older cells that drift slowly from one query to the next, so neighbours share most
 // of them as they do in a real prompt; short contexts take every cell). Checks:
 //   1. against FP64, the new kernel's error is no larger than a small multiple of the old kernel's (both FP32 math);
@@ -40,15 +40,16 @@ template <typename T> T* up(const std::vector<T>& h) {
 float h2f(uint16_t b) { __half h; *reinterpret_cast<uint16_t*>(&h) = b; return __half2float(h); }
 uint16_t f2h(float f) { __half h = __float2half(f); return *reinterpret_cast<uint16_t*>(&h); }
 
-int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2 q4_0
+int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2 q4_0, 3 nvfp4
+    const char* name = fmt == 3 ? "nvfp4" : fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16";
 #if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
-    if (fmt == 2) {   // mode 4 (Q4_0 KV) runs on sm_80 and newer only: below that the dispatcher keeps the old kernel
+    if (fmt >= 2) {   // 4-bit KV (q4_0's mode 4, the NVFP4 kernel) runs on sm_80 and newer only: below that the old kernel
         int dev = 0, major = 0;
         ck(cudaGetDevice(&dev), "device");
         ck(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev), "cc");
         if (major < 8) {
-            std::printf("SKIP q4_0 ctx %lld: the tensor-core kernel takes Q4_0 KV on sm_80+ only (this device: sm_%d)\n",
-                        (long long) ctx, major);
+            std::printf("SKIP %s ctx %lld: the tensor-core kernel takes 4-bit KV on sm_80+ only (this device: sm_%d)\n",
+                        name, (long long) ctx, major);
             return 0;
         }
     }
@@ -65,7 +66,17 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     std::vector<uint16_t> ks, vs, kh, vh;
     std::vector<uint8_t> k4, v4;   // q4_0: 8 blocks of {fp16 d, 16 code bytes} per row (kv_q4.hpp)
     constexpr int64_t B4 = 18, ROW4 = 8 * B4;
-    if (fmt == 2) {
+    constexpr int64_t BN = 36;   // nvfp4: 4 blocks of {4 UE4M3 scales, 32 code bytes} per row (kv_q4.hpp), ROW4 bytes too
+    if (fmt == 3) {
+        // the scales as the model's rotated K/V gave them (bench/results/2026-10-14-kv-nvfp4): exponent fields 7..12
+        std::uniform_int_distribution<int> byte(0, 255), ex(7, 12), man(0, 7);
+        k4.resize(rows * ROW4); v4.resize(rows * ROW4);
+        for (auto* pool : {&k4, &v4})
+            for (int64_t b = 0; b < rows * 4; ++b) {
+                for (int u = 0; u < 4; ++u) (*pool)[b * BN + u] = (uint8_t) ((ex(rng) << 3) | man(rng));
+                for (int j = 0; j < 32; ++j) (*pool)[b * BN + 4 + j] = (uint8_t) byte(rng);
+            }
+    } else if (fmt == 2) {
         std::uniform_int_distribution<int> byte(0, 255);
         // the scales as a q4_0 pool holds them: signed (ggml's d = max / -8) and spread over two decades, so a chunk's
         // cells mix signs and magnitudes (a positive-only bound on them overflowed FP16 on real K/V)
@@ -182,7 +193,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         }
     }
     k::QsaAttnPools pl;
-    if (fmt == 2) { pl.k_q4 = up(k4); pl.v_q4 = up(v4); }
+    if (fmt >= 2) { pl.k_q4 = up(k4); pl.v_q4 = up(v4); pl.nvfp4 = fmt == 3; }
     else if (fmt == 1) { pl.k_q = up(kq); pl.v_q = up(vq); pl.k_scale = up(ks); pl.v_scale = up(vs); }
     else { pl.k_pool = up(kh); pl.v_pool = up(vh); }
     // a q4_0 value: block d / 32 of the row, element j = d % 32 in the low nibble of byte j (j < 16), else the high
@@ -194,6 +205,18 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         const int j = (int) (d % 32);
         const int code = j < 16 ? (blk[2 + j] & 0x0F) : (blk[2 + j - 16] >> 4);
         return (double) (code - 8) * h2f(sc);
+    };
+    // an nvfp4 value: block d / 64 of the row, sub-block u = d % 64 / 16, element j = d % 16 in the low nibble of
+    // code byte 8u + j (j < 8), else the high nibble of byte 8u + j - 8; E2M1 times the UE4M3 scale times the global one
+    auto nvv = [&](const std::vector<uint8_t>& pool, int64_t row, int64_t d) {
+        static const double e2m1[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+        const uint8_t* blk = pool.data() + row * ROW4 + (d / 64) * BN;
+        const int u = (int) (d % 64 / 16), j = (int) (d % 16);
+        const uint8_t sb = blk[u], cb = blk[4 + 8 * u + (j & 7)];
+        const int code = j < 8 ? (cb & 0x0F) : (cb >> 4);
+        const int e = (sb >> 3) & 15, m = sb & 7;
+        const double scale = sb == 0x7F ? 0.0 : e == 0 ? std::ldexp((double) m, -9) : std::ldexp(1.0 + m / 8.0, e - 7);
+        return (code & 8 ? -1.0 : 1.0) * e2m1[code & 7] * scale * (double) k::KV_NVFP4_GLOBAL;
     };
     pl.page_table = up(table);
     const int32_t* d_ids = up(ids);
@@ -239,7 +262,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
                 double a = 0;
                 for (int64_t d = 0; d < HD; ++d) {
-                    const double kv = fmt == 2 ? q4v(k4, row, d)
+                    const double kv = fmt == 3 ? nvv(k4, row, d) : fmt == 2 ? q4v(k4, row, d)
                                       : fmt == 1 ? (double) kq[row * HD + d] * h2f(ks[row * 4 + d / 64]) : h2f(kh[row * HD + d]);
                     a += (double) q[(i * NH + h) * HD + d] * kv;
                 }
@@ -252,7 +275,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 double a = 0;
                 for (int64_t c = 0; c < w; ++c) {
                     const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
-                    const double vv = fmt == 2 ? q4v(v4, row, d)
+                    const double vv = fmt == 3 ? nvv(v4, row, d) : fmt == 2 ? q4v(v4, row, d)
                                       : fmt == 1 ? (double) vq[row * HD + d] * h2f(vs[row * 4 + d / 64]) : h2f(vh[row * HD + d]);
                     a += sco[c] * vv;
                 }
@@ -289,7 +312,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     const bool ok2 = diff <= 1e-4 * scale;
     std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
                 "scale); %.3f -> %.3f ms per chunk (%.2fx)\n",
-                ok1 && ok2 ? "PASS" : "FAIL", fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
+                ok1 && ok2 ? "PASS" : "FAIL", name, (long long) ctx, (long long) nq, err_old,
                 err_new, ref_scale, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new);
     cudaFree((void*) d_ids); cudaFree((void*) d_steps); cudaFree((void*) d_q); cudaFree(d_old); cudaFree(d_new);
     cudaFree(scratch);
@@ -327,6 +350,8 @@ int main(int argc, char** argv) {
     fails += run(0, ctx, nq, reps);   // FP16 KV: the RDNA4 kernel takes int8 KV only
     fails += run(2, ctx, nq, reps);   // Q4_0 KV (mode 4)
     fails += run(2, 1500, std::min<int64_t>(nq, 1500), reps);
+    fails += run(3, ctx, nq, reps);   // NVFP4 KV (prompt_attn_fp4_kernel)
+    fails += run(3, 1500, std::min<int64_t>(nq, 1500), reps);
 #endif
     fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);   // short context: the selection is every cell
     fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);    // the identity-to-sparse edge

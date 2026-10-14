@@ -708,6 +708,301 @@ bool launch_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     return true;
 }
 
+// ---- v2 for NVFP4 KV (`--kv nvfp4`): the int8 kernel's structure (warp w owns dims [64w, 64w+64), gathers its own
+// slice with cp.async one chunk ahead, keeps q in registers), and the slice is exactly one NVFP4 block per row: 36
+// bytes (4 UE4M3 scales, 32 code bytes) instead of int8's 64 + its scale. Sub-block u of the block is the MMA's k-step
+// u: lane (gid, tig) reads one 16-bit pair of code bytes, whose low nibbles are its b[0] and high nibbles its b[1]
+// (ggml's layout puts value j and j + 8 in one byte). An NVFP4 value - a doubled E2M1 code (at most 2 significant
+// bits) times a halved UE4M3 scale (4) times KV_NVFP4_GLOBAL, 2^-14 .. 168 - is EXACT in FP16, so each fragment is
+// dequantized to its exact values with one half2 multiply and both products then run as for FP16 K/V: one q.k
+// accumulator over the 64 dims, p packed once per k-step of cells. The values are the ones `kv_gather_nvfp4_step` and
+// the decode kernel use; only the summation order differs.
+constexpr int FP4W = 9;   // 32-bit words per block: the scales, then 8 of codes
+
+struct SmemF {
+    uint32_t kv[2][4][2][CH2 * FP4W];   // stage, warp, K/V, cell-major blocks (36-byte stride: banks spread)
+    __half sc[4][2][CH2][4];            // warp, K/V, cell, sub-block: the current stage's scales (exact in FP16)
+    float part[4][16][CH2 + 1];         // q.k per dim group
+    float p[16][CH2 + 1];
+    float qmax[4];
+    float alpha[16];
+    float lsum[16];
+    float mrow[16];
+};
+
+__device__ __forceinline__ void cp_async4(void* smem, const void* gmem, bool valid) {
+#if !STRATA_PA_SM80
+    __trap();
+#else
+    const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(sa), "l"(gmem), "r"(valid ? 4 : 0));
+#endif
+}
+
+// Two pairs of E2M1 codes as two B registers of exact values: x = {code b0.lo, b0.hi, b1.lo, b1.hi} (a byte each),
+// times the scales of their cells (s0 for b[0]'s two values, s1 for b[1]'s) - every product exact in FP16
+__device__ __forceinline__ void fp4_b(uint32_t x, __half2 s0, __half2 s1, uint32_t* b) {
+    const uint32_t v = nvfp4_codes_to_i8x4(x);
+    uint32_t h0 = i8x2_to_h2(v & 0xffffu), h1 = i8x2_to_h2(v >> 16);
+    const __half2 m0 = __hmul2(*reinterpret_cast<const __half2*>(&h0), s0);
+    const __half2 m1 = __hmul2(*reinterpret_cast<const __half2*>(&h1), s1);
+    b[0] = *reinterpret_cast<const uint32_t*>(&m0);
+    b[1] = *reinterpret_cast<const uint32_t*>(&m1);
+}
+
+__global__ void __launch_bounds__(THREADS) prompt_attn_fp4_kernel(const float* __restrict__ q, QsaAttnPools p,
+                                                                  const int32_t* __restrict__ ids,
+                                                                  const int32_t* __restrict__ steps, int n_kv_heads,
+                                                                  int page_size, float scale_log2,
+                                                                  float* __restrict__ attn, int cap) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    SmemF& S = *reinterpret_cast<SmemF*>(smem_raw);
+    const int qi = blockIdx.x, kvh = blockIdx.y;
+    const int n_head = n_kv_heads * G;
+    q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    ids += (size_t) qi * cap;
+    const int n = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int gid = lane >> 2, tig = lane & 3;
+    const int dim0 = warp * 64;
+    constexpr int ROWB = (HD / QK_NVFP4_KV) * (int) sizeof(block_nvfp4_kv);   // 144 bytes per row
+
+    // q: as the int8 kernel (power-of-two prescale over all 12 heads, this warp's 64 dims as hi/lo A fragments)
+    float qm = 0.0f;
+    for (int i = t; i < G * HD; i += THREADS) qm = fmaxf(qm, fabsf(q[i]));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) qm = fmaxf(qm, __shfl_xor_sync(0xffffffffu, qm, o));
+    if (lane == 0) S.qmax[warp] = qm;
+    if (t < 16) { S.mrow[t] = -INFINITY; S.lsum[t] = 0.0f; }
+    __syncthreads();
+    qm = fmaxf(fmaxf(S.qmax[0], S.qmax[1]), fmaxf(S.qmax[2], S.qmax[3]));
+    int qe = 0;
+    if (qm > 0.0f) frexpf(qm, &qe);
+    const float qup = ldexpf(1.0f, 14 - qe), qdown = ldexpf(scale_log2, qe - 14);
+    uint32_t qh[4][4], ql[4][4];
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const int row = gid + (r & 1) * 8, col = dim0 + kk * 16 + 2 * tig + (r >> 1) * 8;
+            float2 x = make_float2(0.f, 0.f);
+            if (row < G) x = *reinterpret_cast<const float2*>(q + (size_t) row * HD + col);
+            x.x *= qup;
+            x.y *= qup;
+            const __half2 hi = __floats2half2_rn(x.x, x.y);
+            const float2 hf = __half22float2(hi);
+            const __half2 lo = __floats2half2_rn(x.x - hf.x, x.y - hf.y);
+            qh[kk][r] = *reinterpret_cast<const uint32_t*>(&hi);
+            ql[kk][r] = *reinterpret_cast<const uint32_t*>(&lo);
+        }
+    }
+
+    // the chunk pipeline (as the int8 kernel): cells two chunks ahead, rows one ahead, the blocks (cp.async) one ahead.
+    // Word i of a stage (i = lane + 32 j) is word i % 9 of cell i / 9's block: consecutive lanes read consecutive
+    // words.
+    const int n_chunks = (n + CH2 - 1) / CH2;
+    auto cell_of = [&](int c) -> int { return c < n ? __ldg(ids + c) : -1; };
+    auto row_of = [&](int cell) -> long long {
+        if (cell < 0) return -1;
+        const long long page = (long long) __ldg(p.page_table + cell / page_size);
+        return (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+    };
+    auto issue = [&](long long r, int st) {
+#pragma unroll
+        for (int j = 0; j < FP4W; ++j) {
+            const int idx = lane + 32 * j, cell = idx / FP4W, wd = idx % FP4W;
+            const long long rr = __shfl_sync(0xffffffffu, r, cell);
+            const bool ok = rr >= 0;
+            const size_t off = ok ? (size_t) rr * ROWB + (size_t) warp * sizeof(block_nvfp4_kv) + (size_t) wd * 4 : 0;
+            cp_async4(&S.kv[st][warp][0][idx], p.k_q4 + off, ok);
+            cp_async4(&S.kv[st][warp][1][idx], p.v_q4 + off, ok);
+        }
+    };
+    issue(row_of(cell_of(lane)), 0);
+    cp_async_commit();
+    long long r_next = row_of(cell_of(CH2 + lane));
+    int cell_next2 = cell_of(2 * CH2 + lane);
+
+    float acc[8][4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+
+    for (int ci = 0; ci < n_chunks; ++ci) {
+        const int st = ci & 1, c0 = ci * CH2;
+        const bool more = ci + 1 < n_chunks;
+        if (more) issue(r_next, st ^ 1);
+        cp_async_commit();
+        r_next = row_of(cell_next2);
+        cell_next2 = cell_of((ci + 3) * CH2 + lane);
+        cp_async_wait1();
+        __syncwarp();
+        const unsigned char* K = reinterpret_cast<const unsigned char*>(&S.kv[st][warp][0][0]);
+        const unsigned char* V = reinterpret_cast<const unsigned char*>(&S.kv[st][warp][1][0]);
+        // this stage's scales, decoded once: lane = cell (a missing cell's block is zero: scale 0)
+        {
+            const uint32_t kw = S.kv[st][warp][0][lane * FP4W], vw = S.kv[st][warp][1][lane * FP4W];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {   // 2^-14 .. 14: exact in FP16
+                S.sc[warp][0][lane][u] = __float2half_rn(nvfp4_ue4m3_half((uint8_t) (kw >> (8 * u))) * KV_NVFP4_GLOBAL);
+                S.sc[warp][1][lane][u] = __float2half_rn(nvfp4_ue4m3_half((uint8_t) (vw >> (8 * u))) * KV_NVFP4_GLOBAL);
+            }
+        }
+        __syncwarp();
+        // q.k over this warp's 64 dims: k-step u is sub-block u, its codes times the cell's scale (one per lane: the
+        // lane's B column is cell nt * 8 + gid)
+#pragma unroll
+        for (int nt = 0; nt < CH2 / 8; ++nt) {
+            float tg[4] = {0.f, 0.f, 0.f, 0.f};
+            const int cell = nt * 8 + gid, c = nt * 8 + 2 * tig;
+            const unsigned char* kb = K + cell * (FP4W * 4) + 4 + 2 * tig;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const uint32_t x = *reinterpret_cast<const uint16_t*>(kb + 8 * u);
+                const __half2 sk = __half2half2(S.sc[warp][0][cell][u]);
+                uint32_t b[2];
+                fp4_b((x & 0x0f0fu) | (((x >> 4) & 0x0f0fu) << 16), sk, sk, b);
+                mma16816(tg, qh[u], b);
+                mma16816(tg, ql[u], b);
+            }
+            S.part[warp][gid][c] = tg[0];
+            S.part[warp][gid][c + 1] = tg[1];
+            S.part[warp][gid + 8][c] = tg[2];
+            S.part[warp][gid + 8][c + 1] = tg[3];
+        }
+        __syncthreads();
+        // online softmax over the four groups' sum (fixed order): row t/8, 4 cells per thread (as the int8 kernel)
+        {
+            const int r = t >> 3, sub = t & 7;
+            float x[4], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = sub * 4 + j;
+                x[j] = c0 + c < n ? (((S.part[0][r][c] + S.part[1][r][c]) + S.part[2][r][c]) + S.part[3][r][c]) * qdown
+                                  : -INFINITY;
+                mx = fmaxf(mx, x[j]);
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = S.mrow[r];
+            const float m_new = fmaxf(m_old, mx);
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float e = x[j] == -INFINITY ? 0.0f : exp2f(x[j] - m_new);
+                S.p[r][sub * 4 + j] = e;
+                sum += e;
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            __syncwarp();
+            if (sub == 0) {
+                const float a = m_old == -INFINITY ? 0.0f : exp2f(m_old - m_new);
+                S.alpha[r] = a;
+                S.lsum[r] = fmaf(S.lsum[r], a, sum);
+                S.mrow[r] = m_new;
+            }
+        }
+        __syncthreads();
+        // p.v over this warp's 64 dims: p times 2^14 (|p'| <= 2^14: its lo half out of FP16's subnormals, as v1) as
+        // hi/lo halves once per k-step of 16 cells, V's fragments as exact values; the 2^14 comes back out in FP32
+        {
+            float tmp[8][4];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) tmp[j][0] = tmp[j][1] = tmp[j][2] = tmp[j][3] = 0.0f;
+#pragma unroll
+            for (int ks = 0; ks < CH2 / 16; ++ks) {
+                const int cA = ks * 16 + 2 * tig, cB = cA + 8;
+                const float p00 = S.p[gid][cA] * 16384.0f, p01 = S.p[gid][cA + 1] * 16384.0f;
+                const float p10 = S.p[gid + 8][cA] * 16384.0f, p11 = S.p[gid + 8][cA + 1] * 16384.0f;
+                const float p02 = S.p[gid][cB] * 16384.0f, p03 = S.p[gid][cB + 1] * 16384.0f;
+                const float p12 = S.p[gid + 8][cB] * 16384.0f, p13 = S.p[gid + 8][cB + 1] * 16384.0f;
+                uint32_t ah[4], al[4];
+                ah[0] = pack_h2(p00, p01);
+                ah[1] = pack_h2(p10, p11);
+                ah[2] = pack_h2(p02, p03);
+                ah[3] = pack_h2(p12, p13);
+                {
+                    const __half2* h = reinterpret_cast<const __half2*>(ah);
+                    float2 f;
+                    f = __half22float2(h[0]); al[0] = pack_h2(p00 - f.x, p01 - f.y);
+                    f = __half22float2(h[1]); al[1] = pack_h2(p10 - f.x, p11 - f.y);
+                    f = __half22float2(h[2]); al[2] = pack_h2(p02 - f.x, p03 - f.y);
+                    f = __half22float2(h[3]); al[3] = pack_h2(p12 - f.x, p13 - f.y);
+                }
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    // dim 16u + gid (n-tile 2u) is the low nibble of code byte 8u + gid, dim 16u + 8 + gid (n-tile
+                    // 2u + 1) the high nibble of the same byte: four cells' bytes serve both n-tiles
+                    const int o = 4 + 8 * u + gid;
+                    constexpr int CB = FP4W * 4;   // bytes per cell
+                    const uint32_t yA = (uint32_t) V[cA * CB + o] | ((uint32_t) V[(cA + 1) * CB + o] << 8);
+                    const uint32_t yB = (uint32_t) V[cB * CB + o] | ((uint32_t) V[(cB + 1) * CB + o] << 8);
+                    const uint32_t y = yA | (yB << 16);
+                    const __half2 sA = __halves2half2(S.sc[warp][1][cA][u], S.sc[warp][1][cA + 1][u]);
+                    const __half2 sB = __halves2half2(S.sc[warp][1][cB][u], S.sc[warp][1][cB + 1][u]);
+                    uint32_t b[2];
+                    fp4_b(y & 0x0f0f0f0fu, sA, sB, b);
+                    mma16816(tmp[2 * u], ah, b);
+                    mma16816(tmp[2 * u], al, b);
+                    fp4_b((y >> 4) & 0x0f0f0f0fu, sA, sB, b);
+                    mma16816(tmp[2 * u + 1], ah, b);
+                    mma16816(tmp[2 * u + 1], al, b);
+                }
+            }
+            const float a0 = S.alpha[gid], a1 = S.alpha[gid + 8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                acc[j][0] = fmaf(acc[j][0], a0, tmp[j][0] * (1.0f / 16384.0f));
+                acc[j][1] = fmaf(acc[j][1], a0, tmp[j][1] * (1.0f / 16384.0f));
+                acc[j][2] = fmaf(acc[j][2], a1, tmp[j][2] * (1.0f / 16384.0f));
+                acc[j][3] = fmaf(acc[j][3], a1, tmp[j][3] * (1.0f / 16384.0f));
+            }
+        }
+        __syncwarp();   // the stage's scales are rewritten from the next stage
+    }
+    __syncthreads();
+    const float l0 = S.lsum[gid], l1 = S.lsum[gid + 8];
+    const float i0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, i1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int d = dim0 + j * 8 + 2 * tig;
+        *reinterpret_cast<float2*>(attn + (size_t) gid * HD + d) = make_float2(acc[j][0] * i0, acc[j][1] * i0);
+        if (gid + 8 < G)
+            *reinterpret_cast<float2*>(attn + (size_t) (gid + 8) * HD + d) = make_float2(acc[j][2] * i1, acc[j][3] * i1);
+    }
+}
+
+bool launch_fp4(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+                const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+    static bool attr[64] = {};   // the shared-memory opt-in is per device
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const int bytes = (int) sizeof(SmemF);
+    if (dev < 0 || dev >= 64) return false;
+    if (!attr[dev]) {
+        if (cudaFuncSetAttribute(prompt_attn_fp4_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
+            cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        attr[dev] = true;
+    }
+    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
+    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
+        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
+        prompt_attn_fp4_kernel<<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, bytes, st>>>(
+            q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
+            (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_prompt_attn_batch: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+}
+
 template <int KV_MODE>
 bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
             const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
@@ -1502,6 +1797,7 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         }();
         // sm_80+ only: on Turing mode 4 would run as pairs of m16n8k8 MMAs, which no parity run has checked yet
         if (q4_off || turing || pools.v_q4 == nullptr) return false;
+        if (pools.nvfp4) return launch_fp4(q, pools, ids, steps, cap, s, attn, n_q, st);   // --kv nvfp4
         return launch<4>(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (pools.k_q != nullptr && pools.v_q4 != nullptr) {   // hybrid K8V4: int8 K + dequantized-q4 V

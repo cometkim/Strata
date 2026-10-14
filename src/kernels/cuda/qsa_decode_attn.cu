@@ -74,10 +74,36 @@ __device__ __forceinline__ void load8_q4(const QsaAttnPools& p, bool value, long
         for (int k = 0; k < 8; ++k) out[k] = (float) ((int)(bytes[k] >> 4) - 8) * d;
     }
 }
+// NVFP4 (`--kv nvfp4`, kv_q4.hpp): d0 is a multiple of 8, so the 8 values are one half of a 16-value sub-block -
+// the low nibbles of its 8 code bytes (first half) or their high nibbles (second half).
+__device__ __forceinline__ void load8_nvfp4(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
+    constexpr int bytes_per_head = (HD / QK_NVFP4_KV) * sizeof(block_nvfp4_kv);
+    const block_nvfp4_kv* blk =
+        reinterpret_cast<const block_nvfp4_kv*>((value ? p.v_q4 : p.k_q4) + row * bytes_per_head) + d0 / QK_NVFP4_KV;
+    const int sub = (d0 % QK_NVFP4_KV) / QK_NVFP4_KV_SUB;
+    const float d = nvfp4_ue4m3_half(blk->d[sub]) * KV_NVFP4_GLOBAL;
+    // two 4-byte loads: a block is 36 bytes, so its code bytes are 4-byte but not always 8-byte aligned
+    const uint32_t raw[2] = {reinterpret_cast<const uint32_t*>(blk->qs + sub * 8)[0],
+                             reinterpret_cast<const uint32_t*>(blk->qs + sub * 8)[1]};
+    const int shift = (d0 % QK_NVFP4_KV_SUB) ? 4 : 0;
+    const uint32_t v[2] = {nvfp4_codes_to_i8x4((raw[0] >> shift) & 0x0F0F0F0Fu),
+                           nvfp4_codes_to_i8x4((raw[1] >> shift) & 0x0F0F0F0Fu)};
+    const int8_t* vals = reinterpret_cast<const int8_t*>(v);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) out[k] = (float) vals[k] * d;
+}
+__device__ __forceinline__ float load1_nvfp4(const uint8_t* pool, long long row, int d) {
+    constexpr int bytes_per_head = (HD / QK_NVFP4_KV) * sizeof(block_nvfp4_kv);
+    const block_nvfp4_kv* blk = reinterpret_cast<const block_nvfp4_kv*>(pool + row * bytes_per_head) + d / QK_NVFP4_KV;
+    const int sub = (d % QK_NVFP4_KV) / QK_NVFP4_KV_SUB, j = d % QK_NVFP4_KV_SUB;
+    const uint8_t byte = blk->qs[sub * 8 + (j & 7)];
+    return (float) nvfp4_kvalue2(j < 8 ? (byte & 0x0F) : (byte >> 4)) * nvfp4_ue4m3_half(blk->d[sub]) * KV_NVFP4_GLOBAL;
+}
 template <int KV_MODE>
 __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
     if constexpr (KV_MODE == 0) load8_f16(p, value, row, d0, out);
     else if constexpr (KV_MODE == 1) load8_q8(p, value, row, d0, out);
+    else if constexpr (KV_MODE == 4) load8_nvfp4(p, value, row, d0, out);
     else if constexpr (KV_MODE == 3) {
         // hybrid K8V4: both sides are defined - K unrotated INT8, V rotated Q4_0 - so a value=true call
         // reads the Q4_0 pool instead of dereferencing the null v_q (no call site does today; PR review)
@@ -263,6 +289,8 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
         } else if constexpr (KV_MODE == 1) {
             const float sc = __half2float(__ushort_as_half(p.v_scale[srow[c] * (HD / KV_Q8_GROUP) + t / KV_Q8_GROUP]));
             v = (float) p.v_q[srow[c] * HD + t] * sc;
+        } else if constexpr (KV_MODE == 4) {   // rotated NVFP4 (kv_q4.hpp); the caller rotates the output back
+            v = load1_nvfp4(p.v_q4, srow[c], t);
         } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
             constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
             const int b = t / QK4_0;
@@ -353,6 +381,8 @@ __device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, i
     } else if constexpr (KV_MODE == 1) {
         const float sc = __half2float(__ushort_as_half(p.v_scale[row * (HD / KV_Q8_GROUP) + d / KV_Q8_GROUP]));
         return (float) p.v_q[row * HD + d] * sc;
+    } else if constexpr (KV_MODE == 4) {   // rotated NVFP4 (kv_q4.hpp)
+        return load1_nvfp4(p.v_q4, row, d);
     } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
         constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
         const int b = d / QK4_0;
@@ -625,8 +655,8 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
         std::exit(1);
     }
-    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
-                        : (pools.k_q != nullptr ? 1 : 0));
+    const int kv_mode = pools.k_q4 != nullptr ? (pools.nvfp4 ? 4 : 2)
+                        : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3 : (pools.k_q != nullptr ? 1 : 0));
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
     const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
@@ -653,7 +683,8 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
 #endif
 #define STRATA_ATTN_LC(M) attn_chunk_kernel<M, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
     if (lane_cell) {
-        if (kv_mode == 3) STRATA_ATTN_LC(3);
+        if (kv_mode == 4) STRATA_ATTN_LC(4);
+        else if (kv_mode == 3) STRATA_ATTN_LC(3);
         else if (kv_mode == 2) STRATA_ATTN_LC(2);
         else if (kv_mode == 1) STRATA_ATTN_LC(1);
         else STRATA_ATTN_LC(0);
@@ -689,7 +720,10 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         }
     } else
 #endif
-    if (kv_mode == 3)
+    if (kv_mode == 4)
+        STRATA_ATTN_CHUNK(4)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+    else if (kv_mode == 3)
         STRATA_ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
     else if (kv_mode == 2)
@@ -722,10 +756,10 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
         std::fprintf(stderr, "qsa_decode_attn: unsupported geometry or missing buffers\n");
         std::exit(1);
     }
-    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
-                        : (pools.k_q != nullptr ? 1 : 0));
+    const int kv_mode = pools.k_q4 != nullptr ? (pools.nvfp4 ? 4 : 2)
+                        : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3 : (pools.k_q != nullptr ? 1 : 0));
     if (kv_mode == 3 ? (!pools.k_scale || !pools.v_q4)
-                     : (kv_mode == 2 ? (!pools.v_q4) : (kv_mode == 1 ? (!pools.v_q || !pools.k_scale || !pools.v_scale)
+                     : (kv_mode == 2 || kv_mode == 4 ? (!pools.v_q4) : (kv_mode == 1 ? (!pools.v_q || !pools.k_scale || !pools.v_scale)
                                                                      : (!pools.k_pool || !pools.v_pool)))) {
         std::fprintf(stderr, "qsa_decode_attn: incomplete KV pools\n");
         std::exit(1);
@@ -737,7 +771,10 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv);
     cudaStream_t st = (cudaStream_t) stream;
-    if (kv_mode == 3)
+    if (kv_mode == 4)
+        STRATA_ATTN_CHUNK(4)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+    else if (kv_mode == 3)
         STRATA_ATTN_CHUNK(3)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);
     else if (kv_mode == 2)

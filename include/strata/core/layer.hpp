@@ -219,6 +219,9 @@ struct QsaState {
     bool kv_q4 = false;
     uint8_t* k_q4 = nullptr;
     uint8_t* v_q4 = nullptr;
+    /// `--kv nvfp4`: the kv_q4 pools hold rotated NVFP4 blocks instead of q4_0 (kv_q4.hpp; the same 144 B per cell
+    /// and head). Set only together with kv_q4.
+    bool kv_nvfp4 = false;
     /// Hybrid K8V4: K in INT8 (unrotated - the scores stay exact), V in rotated Q4_0 (kv_q4.hpp): 816 B per cell.
     /// Uses k_q/k_scale + v_q4. Mode 0 only (no KV streaming, no ring); under this setting the MTP drafter's
     /// ring state stays plain INT8, so the block movers never see the hybrid layout.
@@ -315,6 +318,9 @@ bool qsa_kv_int8();
 /// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);
 bool qsa_kv_q4();
+/// `--kv nvfp4`: with qsa_set_kv_q4(true), the 4-bit pools hold NVFP4 (UE4M3 scale per 16 values) instead of q4_0.
+void qsa_set_kv_nvfp4(bool enabled);
+bool qsa_kv_nvfp4();
 /// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell; streams with --kv-resident too.
 void qsa_set_kv_hybrid(bool enabled);
 bool qsa_kv_hybrid();
